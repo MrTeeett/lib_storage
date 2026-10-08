@@ -132,7 +132,8 @@ private:
 	bool readHeader();
 	bool writeHeader();
 
-	void readBinlog();
+	bool readBinlog();
+	bool rotateBinlog();
 	template <typename Reader, typename ...Handlers>
 	void readBinlogHelper(Reader &reader, Handlers &&...handlers);
 	template <typename Record, typename Postprocess>
@@ -185,7 +186,7 @@ private:
 	void setMapEntry(const Key &key, Entry &&entry);
 	void eraseMapEntry(const Map::const_iterator &i);
 	void recordEntryAccess(const Key &key);
-	QByteArray readValueData(PlaceId place, size_type size) const;
+	QByteArray readValueData(const Key &key, const Entry &entry) const;
 
 	Version findAvailableVersion() const;
 	QString versionPath() const;
@@ -201,6 +202,8 @@ private:
 		uint32 checksum);
 	Error writeNewEntry(
 		const QString &path,
+		const Key &key,
+		uint8 tag,
 		QByteArray &&content);
 	template <typename StoreRecord>
 	Error writeKeyPlaceGeneric(
@@ -214,14 +217,6 @@ private:
 		const PlaceId &place,
 		const TaggedValue &value,
 		uint32 checksum);
-	template <typename StoreRecord>
-	Error writeExistingPlaceGeneric(
-		StoreRecord &&record,
-		const Key &key,
-		const Entry &entry);
-	Error writeExistingPlace(
-		const Key &key,
-		const Entry &entry);
 	void writeMultiRemoveLazy();
 	Error writeMultiRemove();
 	void writeMultiAccessLazy();

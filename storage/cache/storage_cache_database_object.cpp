@@ -6,6 +6,7 @@
 //
 #include "storage/cache/storage_cache_database_object.h"
 
+#include "storage/cache/storage_cache_authentication.h"
 #include "storage/cache/storage_cache_cleaner.h"
 #include "storage/cache/storage_cache_compactor.h"
 #include "storage/cache/storage_cache_binlog_reader.h"
@@ -211,8 +212,16 @@ File::Result DatabaseObject::openBinlog(
 	}
 	_path = computePath(version);
 	_key = std::move(key);
+	if (!readBinlog()
+		|| (headerRequired && mode == File::Mode::ReadAppend && !rotateBinlog())) {
+		key = std::move(_key);
+		_binlog.close();
+		clearState();
+		return File::Result::Failed;
+	}
+	adjustRelativeTime();
+	optimize();
 	createCleaner();
-	readBinlog();
 	return File::Result::Success;
 }
 
@@ -247,7 +256,7 @@ void DatabaseObject::readBinlogHelper(
 	}
 }
 
-void DatabaseObject::readBinlog() {
+bool DatabaseObject::readBinlog() {
 	BinlogWrapper wrapper(_binlog, _settings);
 	if (_settings.trackEstimatedTime) {
 		BinlogReader<
@@ -279,8 +288,33 @@ void DatabaseObject::readBinlog() {
 			return processRecordMultiRemove(header, element);
 		});
 	}
-	adjustRelativeTime();
-	optimize();
+	if (wrapper.failed() || _binlog.offset() != _binlog.size()) {
+		return false;
+	}
+	return true;
+}
+
+bool DatabaseObject::rotateBinlog() {
+	const auto ready = compactReadyPath();
+	File replacement;
+	if (replacement.open(ready, File::Mode::Write, _key) != File::Result::Success
+		|| !_binlog.seek(0)) {
+		return false;
+	}
+	auto buffer = bytes::vector(std::max(size_type(16), _settings.readBlockSize));
+	while (_binlog.offset() < _binlog.size()) {
+		const auto size = std::min(int64(buffer.size()), _binlog.size() - _binlog.offset());
+		const auto part = bytes::make_span(buffer).subspan(0, size);
+		if (_binlog.read(part) != size || !replacement.write(part)) {
+			return false;
+		}
+	}
+	if (!replacement.flush()) return false;
+	replacement.close();
+	_binlog.close();
+	if (!File::Move(ready, binlogPath())) return false;
+	return _binlog.open(binlogPath(), File::Mode::ReadAppend, _key) == File::Result::Success
+		&& _binlog.seek(_binlog.size());
 }
 
 uint64 DatabaseObject::countRelativeTime() const {
@@ -789,7 +823,7 @@ void DatabaseObject::put(
 		}
 		return true;
 	};
-	if (!check(writeNewEntry(change.nowPath, std::move(value.bytes)))
+	if (!check(writeNewEntry(change.nowPath, key, value.tag, std::move(value.bytes)))
 		|| !check(writeKeyPlace(key, change.nowPlace, value, checksum))) {
 		return;
 	}
@@ -821,7 +855,7 @@ DatabaseObject::KeyPlaceChange DatabaseObject::chooseKeyPlace(
 		if (already.tag == value.tag
 			&& already.size == size
 			&& already.checksum == checksum
-			&& readValueData(already.place, size) == value.bytes) {
+			&& readValueData(key, already) == value.bytes) {
 			return KeyPlaceChange{ alreadyPath, QString() };
 		}
 		const auto nowPlace = generatePlace();
@@ -833,7 +867,12 @@ DatabaseObject::KeyPlaceChange DatabaseObject::chooseKeyPlace(
 
 Error DatabaseObject::writeNewEntry(
 		const QString &path,
+		const Key &key,
+		uint8 tag,
 		QByteArray &&content) {
+	const auto secret = QByteArray::fromRawData(
+		reinterpret_cast<const char*>(_key.data().data()), _key.data().size());
+	auto authenticated = SealCacheValue(secret, key.high, key.low, tag, content);
 	auto file = File();
 	switch (file.open(path, File::Mode::Write, _key)) {
 	case File::Result::Failed:
@@ -843,7 +882,7 @@ Error DatabaseObject::writeNewEntry(
 		return Error{ Error::Type::LockFailed, path };
 
 	case File::Result::Success:
-		return (file.writeWithPadding(bytes::make_detached_span(content))
+		return (file.writeWithPadding(bytes::make_detached_span(authenticated))
 			&& file.flush())
 			? Error::NoError()
 			: ioError(path);
@@ -905,61 +944,6 @@ Error DatabaseObject::writeKeyPlace(
 	return writeKeyPlaceGeneric(record, key, place, data, checksum);
 }
 
-template <typename StoreRecord>
-Error DatabaseObject::writeExistingPlaceGeneric(
-		StoreRecord &&record,
-		const Key &key,
-		const Entry &entry) {
-	record.key = key;
-	record.tag = entry.tag;
-	record.setSize(entry.size);
-	record.checksum = entry.checksum;
-	if (const auto i = _map.find(key); i != end(_map)) {
-		const auto &already = i->second;
-		if (already.tag == record.tag
-			&& already.size == entry.size
-			&& already.checksum == entry.checksum
-			&& (readValueData(already.place, already.size)
-				== readValueData(entry.place, entry.size))) {
-			return Error::NoError();
-		}
-	}
-	record.place = entry.place;
-	auto writeable = record;
-	const auto success = _binlog.write(bytes::object_as_span(&writeable));
-	if (!success) {
-		_binlog.close();
-		return ioError(binlogPath());
-	}
-	_binlog.flush();
-
-	const auto applied = processRecordStore(
-		&record,
-		std::is_class<StoreRecord>{});
-	Assert(applied);
-	return Error::NoError();
-}
-
-Error DatabaseObject::writeExistingPlace(
-		const Key &key,
-		const Entry &entry) {
-	if (!_settings.trackEstimatedTime) {
-		return writeExistingPlaceGeneric(Store(), key, entry);
-	}
-	auto record = StoreWithTime();
-	record.time = countTimePoint();
-	const auto writing = record.time.getRelative();
-	const auto current = _time.getRelative();
-	Assert(writing >= current);
-	if ((writing - current) * crl::time(1000)
-		< _settings.writeBundleDelay) {
-		// We don't want to produce a lot of unique _time.relative values.
-		// So if change in it is not large we stick to the old value.
-		record.time = _time;
-	}
-	return writeExistingPlaceGeneric(std::move(record), key, entry);
-}
-
 void DatabaseObject::get(
 		const Key &key,
 		FnMut<void(TaggedValue&&)> &&done) {
@@ -970,7 +954,7 @@ void DatabaseObject::get(
 	}
 	const auto &entry = i->second;
 
-	auto bytes = readValueData(entry.place, entry.size);
+	auto bytes = readValueData(key, entry);
 	if (bytes.isEmpty()) {
 		remove(key, nullptr);
 		invokeCallback(done, TaggedValue());
@@ -1003,9 +987,10 @@ void DatabaseObject::getWithSizes(
 }
 
 QByteArray DatabaseObject::readValueData(
-		PlaceId place,
-		size_type size) const {
-	const auto path = placePath(place);
+		const Key &key,
+		const Entry &entry) const {
+	const auto path = placePath(entry.place);
+	const auto size = entry.size + 40;
 	File data;
 	const auto result = data.open(path, File::Mode::Read, _key);
 	switch (result) {
@@ -1018,7 +1003,10 @@ QByteArray DatabaseObject::readValueData(
 		if (read != size) {
 			return QByteArray();
 		}
-		return result;
+		const auto secret = QByteArray::fromRawData(
+			reinterpret_cast<const char*>(_key.data().data()), _key.data().size());
+		const auto opened = OpenCacheValue(secret, key.high, key.low, entry.tag, result);
+		return opened ? *opened : QByteArray();
 	} break;
 	}
 	Unexpected("Result in DatabaseObject::get.");
@@ -1087,24 +1075,15 @@ void DatabaseObject::moveIfEmpty(
 		invokeCallback(done, Error::NoError());
 		return;
 	}
-	const auto i = _map.find(from);
-	if (i == _map.end()) {
-		invokeCallback(done, Error::NoError());
-		return;
-	}
-	_removing.emplace(from);
-
-	const auto entry = i->second;
-	eraseMapEntry(i);
-
-	const auto result = writeMultiRemove();
-	if (result.type != Error::Type::None) {
-		invokeCallback(done, result);
-		return;
-	}
-	_removing.erase(to);
-	_stale.erase(ranges::remove(_stale, to), end(_stale));
-	invokeCallback(done, writeExistingPlace(to, entry));
+	get(from, [&](TaggedValue &&value) {
+		put(to, std::move(value), [&](Error error) {
+			if (error.type != Error::Type::None) {
+				invokeCallback(done, error);
+			} else {
+				remove(from, std::move(done));
+			}
+		});
+	});
 }
 
 rpl::producer<Stats> DatabaseObject::stats() const {

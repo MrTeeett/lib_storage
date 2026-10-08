@@ -13,6 +13,7 @@ get_filename_component(src_loc . REALPATH)
 target_precompile_headers(lib_storage PRIVATE ${src_loc}/storage/storage_pch.h)
 nice_target_sources(lib_storage ${src_loc}
 PRIVATE
+    storage/cache/storage_cache_authentication.h
     storage/storage_clear_legacy.cpp
     storage/storage_clear_legacy_posix.cpp
     storage/storage_clear_legacy_win.cpp

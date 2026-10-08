@@ -163,8 +163,8 @@ File::Result File::readHeader(const EncryptionKey &key) {
 		- int64(sizeof(BasicHeader))
 		- base::FileLock::kSkipBytes;
 	Assert(_dataSize >= 0);
-	if (const auto bad = (_dataSize % kBlockSize)) {
-		_dataSize -= bad;
+	if (_dataSize % kBlockSize) {
+		return Result::Failed;
 	}
 	return Result::Success;
 }
